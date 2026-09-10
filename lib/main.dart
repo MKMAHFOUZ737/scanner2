@@ -10,6 +10,7 @@ import 'package:image/image.dart' as img;
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
+import 'package:share_plus/share_plus.dart';
 
 List<CameraDescription> cameras = [];
 
@@ -73,7 +74,6 @@ extension ScanFilterX on ScanFilter {
   }
 }
 
-/// A scanned page: keeps the original so filters can be changed any time.
 class ScanPage {
   Uint8List original;
   Uint8List current;
@@ -88,7 +88,6 @@ class _FilterJob {
   const _FilterJob(this.bytes, this.filter);
 }
 
-/// Top-level function so it can run in a background isolate (compute).
 Uint8List applyFilterSync(_FilterJob job) {
   if (job.filter == ScanFilter.color) return job.bytes;
 
@@ -109,7 +108,6 @@ Uint8List applyFilterSync(_FilterJob job) {
     case ScanFilter.blackWhite:
       out = img.grayscale(decoded);
       out = img.adjustColor(out, contrast: 1.6);
-      // Lower threshold = lighter result, higher = darker.
       out = img.luminanceThreshold(out, threshold: 0.55);
       break;
   }
@@ -256,8 +254,6 @@ class _ScannerScreenState extends State<ScannerScreen> {
     }
   }
 
-  // ----------------------------- FILTERS ---------------------------------
-
   Future<void> _setFilterForCurrent(ScanFilter filter) async {
     if (_pages.isEmpty || _isProcessing) return;
     final page = _currentPage;
@@ -297,8 +293,6 @@ class _ScannerScreenState extends State<ScannerScreen> {
     }
   }
 
-  // ------------------------------ CROP -----------------------------------
-
   Future<void> _cropCurrentPage() async {
     if (_pages.isEmpty || _isProcessing) return;
 
@@ -325,35 +319,56 @@ class _ScannerScreenState extends State<ScannerScreen> {
     }
   }
 
-  // ------------------------------ EXPORT ---------------------------------
+  Future<Uint8List?> _generatePdfBytes() async {
+    if (_pages.isEmpty) return null;
+
+    final pdf = pw.Document();
+
+    for (final page in _pages) {
+      final pdfImage = pw.MemoryImage(page.current);
+      pdf.addPage(
+        pw.Page(
+          pageFormat: PdfPageFormat.a4,
+          build: (pw.Context context) {
+            return pw.FullPage(
+              ignoreMargins: true,
+              child: pw.Image(pdfImage, fit: pw.BoxFit.contain),
+            );
+          },
+        ),
+      );
+    }
+
+    return pdf.save();
+  }
 
   Future<void> _downloadPDF() async {
-    if (_pages.isEmpty) return;
+    final bytes = await _generatePdfBytes();
+    if (bytes == null) return;
 
     try {
-      final pdf = pw.Document();
-
-      for (final page in _pages) {
-        final pdfImage = pw.MemoryImage(page.current);
-        pdf.addPage(
-          pw.Page(
-            pageFormat: PdfPageFormat.a4,
-            build: (pw.Context context) {
-              return pw.FullPage(
-                ignoreMargins: true,
-                child: pw.Image(pdfImage, fit: pw.BoxFit.contain),
-              );
-            },
-          ),
-        );
-      }
-
       await Printing.layoutPdf(
-        onLayout: (PdfPageFormat format) async => pdf.save(),
+        onLayout: (PdfPageFormat format) async => bytes,
         name: 'Scanned_${DateTime.now().millisecondsSinceEpoch}.pdf',
       );
     } catch (e) {
       _showMsg('PDF Error: $e');
+    }
+  }
+
+  Future<void> _sharePDF() async {
+    final bytes = await _generatePdfBytes();
+    if (bytes == null) return;
+
+    try {
+      final xfile = XFile.fromData(
+        bytes,
+        mimeType: 'application/pdf',
+        name: 'Scanned_${DateTime.now().millisecondsSinceEpoch}.pdf',
+      );
+      await Share.shareXFiles([xfile], text: 'Scanned document');
+    } catch (e) {
+      _showMsg('Share failed: $e');
     }
   }
 
@@ -415,8 +430,6 @@ class _ScannerScreenState extends State<ScannerScreen> {
     }
   }
 
-  // ------------------------------ DELETE ---------------------------------
-
   void _deletePage(int index) {
     showDialog(
       context: context,
@@ -449,8 +462,6 @@ class _ScannerScreenState extends State<ScannerScreen> {
     );
   }
 
-  // ------------------------------- UI ------------------------------------
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -461,6 +472,11 @@ class _ScannerScreenState extends State<ScannerScreen> {
         centerTitle: true,
         actions: [
           if (!_isCameraMode && _pages.isNotEmpty) ...[
+            IconButton(
+              icon: const Icon(Icons.share),
+              tooltip: 'Share PDF',
+              onPressed: _sharePDF,
+            ),
             IconButton(
               icon: const Icon(Icons.crop),
               tooltip: 'Crop Current Page',
