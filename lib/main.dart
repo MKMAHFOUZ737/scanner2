@@ -1,5 +1,6 @@
 import 'dart:typed_data';
 
+import 'package:archive/archive.dart';
 import 'package:camera/camera.dart';
 import 'package:crop_your_image/crop_your_image.dart';
 import 'package:file_saver/file_saver.dart';
@@ -9,14 +10,6 @@ import 'package:image/image.dart' as img;
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
-
-/// pubspec.yaml dependencies needed:
-/// camera, pdf, printing, crop_your_image, image, file_saver
-///
-/// NOTE:
-/// - This version works on Web (Chrome/Edge) without dart:io, path_provider, image_cropper.
-/// - crop_your_image v2.x does NOT have rotateLeft/rotateRight on CropController.
-/// - crop_your_image v2.x returns CropResult in onCropped (not Uint8List).
 
 List<CameraDescription> cameras = [];
 
@@ -62,9 +55,6 @@ class _ScannerScreenState extends State<ScannerScreen> {
   int _currentPageIndex = 0;
 
   bool _isResumingCamera = false;
-
-  /// Use a stable key and change it only when switching back to camera mode
-  /// to avoid the "frozen preview / same photo" issue.
   Key _cameraPreviewKey = UniqueKey();
 
   @override
@@ -132,7 +122,7 @@ class _ScannerScreenState extends State<ScannerScreen> {
   void _switchToCameraMode() {
     setState(() {
       _isCameraMode = true;
-      _cameraPreviewKey = UniqueKey(); // force CameraPreview widget rebuild
+      _cameraPreviewKey = UniqueKey(); // avoid frozen preview
     });
     _resumeCamera();
   }
@@ -207,7 +197,7 @@ class _ScannerScreenState extends State<ScannerScreen> {
     }
   }
 
-  /// Crop current page (works on Web too).
+  /// Crop current page (FREE SIZE - not A4).
   Future<void> _cropCurrentPage() async {
     if (_scannedPages.isEmpty) return;
 
@@ -217,8 +207,7 @@ class _ScannerScreenState extends State<ScannerScreen> {
       MaterialPageRoute(
         builder: (_) => CropPage(
           imageBytes: original,
-          // A4-ish ratio: width/height = 1/1.414
-          aspectRatio: 1 / 1.414,
+          aspectRatio: null, // free crop (any size)
         ),
       ),
     );
@@ -230,31 +219,86 @@ class _ScannerScreenState extends State<ScannerScreen> {
     });
   }
 
-  /// Save all scanned pages as PNG files (one per page).
-  Future<void> _downloadPngs() async {
+  /// Save ONLY the CURRENT page as PNG (reliable on web).
+  Future<void> _downloadCurrentPng() async {
     if (_scannedPages.isEmpty) return;
 
     try {
+      final pageNo = _currentPageIndex + 1;
       final ts = DateTime.now().millisecondsSinceEpoch;
 
-      for (int i = 0; i < _scannedPages.length; i++) {
-        final decoded = img.decodeImage(_scannedPages[i]);
-        if (decoded == null) continue;
-
-        final pngBytes = Uint8List.fromList(img.encodePng(decoded));
-
-        await FileSaver.instance.saveFile(
-          name: 'Scanned_${ts}_page${i + 1}',
-          bytes: pngBytes,
-          ext: 'png',
-          mimeType: MimeType.png,
+      final decoded = img.decodeImage(_scannedPages[_currentPageIndex]);
+      if (decoded == null) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Could not decode image for PNG export.'),
+          ),
         );
+        return;
       }
+
+      final pngBytes = Uint8List.fromList(img.encodePng(decoded));
+
+      await FileSaver.instance.saveFile(
+        name: 'Scanned_${ts}_page$pageNo',
+        bytes: pngBytes,
+        ext: 'png',
+        mimeType: MimeType.png,
+      );
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Saved PNG for page $pageNo')));
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(SnackBar(content: Text('PNG save failed: $e')));
+    }
+  }
+
+  /// Save ALL pages as PNG inside a single ZIP file (best for Web).
+  Future<void> _downloadAllPngsAsZip() async {
+    if (_scannedPages.isEmpty) return;
+
+    try {
+      final ts = DateTime.now().millisecondsSinceEpoch;
+
+      final archive = Archive();
+
+      for (int i = 0; i < _scannedPages.length; i++) {
+        final decoded = img.decodeImage(_scannedPages[i]);
+        if (decoded == null) continue;
+
+        final png = img.encodePng(decoded); // List<int>
+        final filename = 'page_${i + 1}.png';
+
+        archive.addFile(ArchiveFile(filename, png.length, png));
+      }
+
+      final zipped = ZipEncoder().encode(archive);
+      if (zipped == null) {
+        throw Exception('ZIP encoding failed');
+      }
+
+      await FileSaver.instance.saveFile(
+        name: 'Scanned_${ts}_PNG_ALL',
+        bytes: Uint8List.fromList(zipped),
+        ext: 'zip',
+        mimeType: MimeType.zip, // if this fails in your version, tell me
+      );
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Saved ZIP (all pages as PNG).')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('ZIP save failed: $e')));
     }
   }
 
@@ -306,6 +350,11 @@ class _ScannerScreenState extends State<ScannerScreen> {
               icon: const Icon(Icons.crop),
               tooltip: 'Crop Current Page',
               onPressed: _cropCurrentPage,
+            ),
+            IconButton(
+              icon: const Icon(Icons.folder_zip),
+              tooltip: 'Save ALL as ZIP (PNG)',
+              onPressed: _downloadAllPngsAsZip,
             ),
             IconButton(
               icon: const Icon(Icons.delete_sweep),
@@ -401,14 +450,6 @@ class _ScannerScreenState extends State<ScannerScreen> {
           Positioned.fill(
             child: CameraPreview(_controller!, key: _cameraPreviewKey),
           ),
-          // A4 guide overlay
-          Container(
-            decoration: BoxDecoration(
-              border: Border.all(color: Colors.white54, width: 2),
-              borderRadius: BorderRadius.circular(8),
-            ),
-            margin: const EdgeInsets.all(32),
-          ),
           if (_scannedPages.isNotEmpty)
             Positioned(
               top: 40,
@@ -472,13 +513,12 @@ class _ScannerScreenState extends State<ScannerScreen> {
             child: Container(
               color: Colors.grey[200],
               padding: const EdgeInsets.all(16),
-              child: AspectRatio(
-                aspectRatio: 1 / 1.414,
+              child: Center(
                 child: ClipRRect(
                   borderRadius: BorderRadius.circular(8),
                   child: Image.memory(
                     _scannedPages[_currentPageIndex],
-                    fit: BoxFit.cover,
+                    fit: BoxFit.contain, // not forcing A4
                   ),
                 ),
               ),
@@ -603,9 +643,9 @@ class _ScannerScreenState extends State<ScannerScreen> {
             const SizedBox(width: 12),
             Expanded(
               child: ElevatedButton.icon(
-                onPressed: _downloadPngs,
+                onPressed: _downloadCurrentPng,
                 icon: const Icon(Icons.image),
-                label: const Text('SAVE PNG'),
+                label: Text('SAVE PNG (${_currentPageIndex + 1})'),
                 style: ElevatedButton.styleFrom(
                   backgroundColor: Colors.grey,
                   foregroundColor: Colors.white,
@@ -634,7 +674,8 @@ class _ScannerScreenState extends State<ScannerScreen> {
   }
 }
 
-/// Crop screen (Web compatible).
+/// Web-compatible crop screen using crop_your_image.
+/// No A4 ratio => free size crop.
 class CropPage extends StatefulWidget {
   final Uint8List imageBytes;
   final double? aspectRatio;
@@ -648,29 +689,6 @@ class CropPage extends StatefulWidget {
 class _CropPageState extends State<CropPage> {
   final CropController _cropController = CropController();
   bool _isCropping = false;
-
-  Uint8List? _tryExtractBytesFromCropResult(CropResult result) {
-    // crop_your_image 2.x returns CropResult, but field names may differ
-    // between versions. Try common possibilities safely.
-    final dynamic r = result;
-
-    try {
-      final v = r.croppedImage;
-      if (v is Uint8List) return v;
-    } catch (_) {}
-
-    try {
-      final v = r.bytes;
-      if (v is Uint8List) return v;
-    } catch (_) {}
-
-    try {
-      final v = r.data;
-      if (v is Uint8List) return v;
-    } catch (_) {}
-
-    return null;
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -699,24 +717,14 @@ class _CropPageState extends State<CropPage> {
           image: widget.imageBytes,
           aspectRatio: widget.aspectRatio,
           onCropped: (CropResult result) {
-            final bytes = _tryExtractBytesFromCropResult(result);
-            if (bytes != null) {
-              Navigator.of(context).pop(bytes);
-              return;
+            if (result is CropSuccess) {
+              Navigator.of(context).pop(result.croppedImage);
+            } else {
+              ScaffoldMessenger.of(
+                context,
+              ).showSnackBar(const SnackBar(content: Text('Crop failed')));
+              Navigator.of(context).pop();
             }
-
-            // If we couldn't read bytes (API mismatch), just close with no result
-            // and show an error.
-            if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text(
-                    'Crop finished but could not read cropped bytes (CropResult API mismatch).',
-                  ),
-                ),
-              );
-            }
-            Navigator.of(context).pop();
           },
         ),
       ),
