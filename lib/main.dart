@@ -39,6 +39,93 @@ class MyApp extends StatelessWidget {
   }
 }
 
+// ---------------------------------------------------------------------------
+// FILTERS
+// ---------------------------------------------------------------------------
+
+enum ScanFilter { color, enhanced, grayscale, blackWhite }
+
+extension ScanFilterX on ScanFilter {
+  String get label {
+    switch (this) {
+      case ScanFilter.color:
+        return 'Color';
+      case ScanFilter.enhanced:
+        return 'Enhanced';
+      case ScanFilter.grayscale:
+        return 'Gray';
+      case ScanFilter.blackWhite:
+        return 'B&W';
+    }
+  }
+
+  IconData get icon {
+    switch (this) {
+      case ScanFilter.color:
+        return Icons.palette;
+      case ScanFilter.enhanced:
+        return Icons.auto_fix_high;
+      case ScanFilter.grayscale:
+        return Icons.gradient;
+      case ScanFilter.blackWhite:
+        return Icons.contrast;
+    }
+  }
+}
+
+/// A scanned page: keeps the original so filters can be changed any time.
+class ScanPage {
+  Uint8List original;
+  Uint8List current;
+  ScanFilter filter;
+
+  ScanPage(this.original) : current = original, filter = ScanFilter.color;
+}
+
+class _FilterJob {
+  final Uint8List bytes;
+  final ScanFilter filter;
+  const _FilterJob(this.bytes, this.filter);
+}
+
+/// Top-level function so it can run in a background isolate (compute).
+Uint8List applyFilterSync(_FilterJob job) {
+  if (job.filter == ScanFilter.color) return job.bytes;
+
+  final decoded = img.decodeImage(job.bytes);
+  if (decoded == null) return job.bytes;
+
+  img.Image out;
+  switch (job.filter) {
+    case ScanFilter.color:
+      out = decoded;
+      break;
+    case ScanFilter.enhanced:
+      out = img.adjustColor(decoded, contrast: 1.35, saturation: 1.1);
+      break;
+    case ScanFilter.grayscale:
+      out = img.grayscale(decoded);
+      break;
+    case ScanFilter.blackWhite:
+      out = img.grayscale(decoded);
+      out = img.adjustColor(out, contrast: 1.6);
+      // Lower threshold = lighter result, higher = darker.
+      out = img.luminanceThreshold(out, threshold: 0.55);
+      break;
+  }
+
+  return Uint8List.fromList(img.encodeJpg(out, quality: 92));
+}
+
+Future<Uint8List> applyFilter(Uint8List bytes, ScanFilter filter) {
+  if (filter == ScanFilter.color) return Future.value(bytes);
+  return compute(applyFilterSync, _FilterJob(bytes, filter));
+}
+
+// ---------------------------------------------------------------------------
+// SCANNER SCREEN
+// ---------------------------------------------------------------------------
+
 class ScannerScreen extends StatefulWidget {
   const ScannerScreen({super.key});
 
@@ -51,11 +138,14 @@ class _ScannerScreenState extends State<ScannerScreen> {
   bool _isInitializing = true;
   bool _isCameraMode = true;
 
-  final List<Uint8List> _scannedPages = [];
+  final List<ScanPage> _pages = [];
   int _currentPageIndex = 0;
 
   bool _isResumingCamera = false;
+  bool _isProcessing = false;
   Key _cameraPreviewKey = UniqueKey();
+
+  ScanPage get _currentPage => _pages[_currentPageIndex];
 
   @override
   void initState() {
@@ -122,9 +212,14 @@ class _ScannerScreenState extends State<ScannerScreen> {
   void _switchToCameraMode() {
     setState(() {
       _isCameraMode = true;
-      _cameraPreviewKey = UniqueKey(); // avoid frozen preview
+      _cameraPreviewKey = UniqueKey();
     });
     _resumeCamera();
+  }
+
+  void _showMsg(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 
   Future<void> _takePicture() async {
@@ -137,8 +232,8 @@ class _ScannerScreenState extends State<ScannerScreen> {
       if (!mounted) return;
 
       setState(() {
-        _scannedPages.add(bytes);
-        _currentPageIndex = _scannedPages.length - 1;
+        _pages.add(ScanPage(bytes));
+        _currentPageIndex = _pages.length - 1;
         _isCameraMode = false;
       });
 
@@ -147,7 +242,7 @@ class _ScannerScreenState extends State<ScannerScreen> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('✓ Page ${_scannedPages.length} captured!'),
+          content: Text('✓ Page ${_pages.length} captured!'),
           duration: const Duration(seconds: 2),
           action: SnackBarAction(
             label: 'SCAN ANOTHER',
@@ -157,28 +252,96 @@ class _ScannerScreenState extends State<ScannerScreen> {
         ),
       );
     } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Capture failed: $e')));
+      _showMsg('Capture failed: $e');
     }
   }
 
+  // ----------------------------- FILTERS ---------------------------------
+
+  Future<void> _setFilterForCurrent(ScanFilter filter) async {
+    if (_pages.isEmpty || _isProcessing) return;
+    final page = _currentPage;
+    if (page.filter == filter) return;
+
+    setState(() => _isProcessing = true);
+    try {
+      final result = await applyFilter(page.original, filter);
+      if (!mounted) return;
+      setState(() {
+        page.current = result;
+        page.filter = filter;
+      });
+    } catch (e) {
+      _showMsg('Filter failed: $e');
+    } finally {
+      if (mounted) setState(() => _isProcessing = false);
+    }
+  }
+
+  Future<void> _applyCurrentFilterToAll() async {
+    if (_pages.isEmpty || _isProcessing) return;
+    final filter = _currentPage.filter;
+
+    setState(() => _isProcessing = true);
+    try {
+      for (final page in _pages) {
+        if (page.filter == filter) continue;
+        page.current = await applyFilter(page.original, filter);
+        page.filter = filter;
+      }
+      _showMsg('Applied "${filter.label}" to all pages');
+    } catch (e) {
+      _showMsg('Filter failed: $e');
+    } finally {
+      if (mounted) setState(() => _isProcessing = false);
+    }
+  }
+
+  // ------------------------------ CROP -----------------------------------
+
+  Future<void> _cropCurrentPage() async {
+    if (_pages.isEmpty || _isProcessing) return;
+
+    final page = _currentPage;
+
+    final Uint8List? cropped = await Navigator.of(context).push<Uint8List>(
+      MaterialPageRoute(
+        builder: (_) => CropPage(imageBytes: page.original, aspectRatio: null),
+      ),
+    );
+
+    if (cropped == null || !mounted) return;
+
+    setState(() => _isProcessing = true);
+    try {
+      final filtered = await applyFilter(cropped, page.filter);
+      if (!mounted) return;
+      setState(() {
+        page.original = cropped;
+        page.current = filtered;
+      });
+    } finally {
+      if (mounted) setState(() => _isProcessing = false);
+    }
+  }
+
+  // ------------------------------ EXPORT ---------------------------------
+
   Future<void> _downloadPDF() async {
-    if (_scannedPages.isEmpty) return;
+    if (_pages.isEmpty) return;
 
     try {
       final pdf = pw.Document();
 
-      for (int i = 0; i < _scannedPages.length; i++) {
-        final pdfImage = pw.MemoryImage(_scannedPages[i]);
+      for (final page in _pages) {
+        final pdfImage = pw.MemoryImage(page.current);
         pdf.addPage(
           pw.Page(
             pageFormat: PdfPageFormat.a4,
             build: (pw.Context context) {
               return pw.FullPage(
                 ignoreMargins: true,
-                child: pw.Image(pdfImage, fit: pw.BoxFit.cover),
+                child: pw.Image(pdfImage, fit: pw.BoxFit.contain),
               );
             },
           ),
@@ -190,51 +353,20 @@ class _ScannerScreenState extends State<ScannerScreen> {
         name: 'Scanned_${DateTime.now().millisecondsSinceEpoch}.pdf',
       );
     } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('PDF Error: $e')));
+      _showMsg('PDF Error: $e');
     }
   }
 
-  /// Crop current page (FREE SIZE - not A4).
-  Future<void> _cropCurrentPage() async {
-    if (_scannedPages.isEmpty) return;
-
-    final Uint8List original = _scannedPages[_currentPageIndex];
-
-    final Uint8List? cropped = await Navigator.of(context).push<Uint8List>(
-      MaterialPageRoute(
-        builder: (_) => CropPage(
-          imageBytes: original,
-          aspectRatio: null, // free crop (any size)
-        ),
-      ),
-    );
-
-    if (cropped == null || !mounted) return;
-
-    setState(() {
-      _scannedPages[_currentPageIndex] = cropped;
-    });
-  }
-
-  /// Save ONLY the CURRENT page as PNG (reliable on web).
   Future<void> _downloadCurrentPng() async {
-    if (_scannedPages.isEmpty) return;
+    if (_pages.isEmpty) return;
 
     try {
       final pageNo = _currentPageIndex + 1;
       final ts = DateTime.now().millisecondsSinceEpoch;
 
-      final decoded = img.decodeImage(_scannedPages[_currentPageIndex]);
+      final decoded = img.decodeImage(_currentPage.current);
       if (decoded == null) {
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Could not decode image for PNG export.'),
-          ),
-        );
+        _showMsg('Could not decode image for PNG export.');
         return;
       }
 
@@ -247,60 +379,43 @@ class _ScannerScreenState extends State<ScannerScreen> {
         mimeType: MimeType.png,
       );
 
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Saved PNG for page $pageNo')));
+      _showMsg('Saved PNG for page $pageNo');
     } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('PNG save failed: $e')));
+      _showMsg('PNG save failed: $e');
     }
   }
 
-  /// Save ALL pages as PNG inside a single ZIP file (best for Web).
   Future<void> _downloadAllPngsAsZip() async {
-    if (_scannedPages.isEmpty) return;
+    if (_pages.isEmpty) return;
 
     try {
       final ts = DateTime.now().millisecondsSinceEpoch;
-
       final archive = Archive();
 
-      for (int i = 0; i < _scannedPages.length; i++) {
-        final decoded = img.decodeImage(_scannedPages[i]);
+      for (int i = 0; i < _pages.length; i++) {
+        final decoded = img.decodeImage(_pages[i].current);
         if (decoded == null) continue;
-
-        final png = img.encodePng(decoded); // List<int>
-        final filename = 'page_${i + 1}.png';
-
-        archive.addFile(ArchiveFile(filename, png.length, png));
+        final png = img.encodePng(decoded);
+        archive.addFile(ArchiveFile('page_${i + 1}.png', png.length, png));
       }
 
       final zipped = ZipEncoder().encode(archive);
-      if (zipped == null) {
-        throw Exception('ZIP encoding failed');
-      }
+      if (zipped == null) throw Exception('ZIP encoding failed');
 
       await FileSaver.instance.saveFile(
         name: 'Scanned_${ts}_PNG_ALL',
         bytes: Uint8List.fromList(zipped),
         ext: 'zip',
-        mimeType: MimeType.zip, // if this fails in your version, tell me
+        mimeType: MimeType.zip,
       );
 
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Saved ZIP (all pages as PNG).')),
-      );
+      _showMsg('Saved ZIP (all pages as PNG).');
     } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('ZIP save failed: $e')));
+      _showMsg('ZIP save failed: $e');
     }
   }
+
+  // ------------------------------ DELETE ---------------------------------
 
   void _deletePage(int index) {
     showDialog(
@@ -317,12 +432,12 @@ class _ScannerScreenState extends State<ScannerScreen> {
             onPressed: () {
               Navigator.pop(context);
               setState(() {
-                _scannedPages.removeAt(index);
-                if (_scannedPages.isEmpty) {
+                _pages.removeAt(index);
+                if (_pages.isEmpty) {
                   _switchToCameraMode();
                   _currentPageIndex = 0;
-                } else if (_currentPageIndex >= _scannedPages.length) {
-                  _currentPageIndex = _scannedPages.length - 1;
+                } else if (_currentPageIndex >= _pages.length) {
+                  _currentPageIndex = _pages.length - 1;
                 }
               });
             },
@@ -334,22 +449,22 @@ class _ScannerScreenState extends State<ScannerScreen> {
     );
   }
 
+  // ------------------------------- UI ------------------------------------
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         title: Text(
-          _isCameraMode
-              ? 'Scan Document'
-              : 'Preview (${_scannedPages.length} pages)',
+          _isCameraMode ? 'Scan Document' : 'Preview (${_pages.length} pages)',
         ),
         centerTitle: true,
         actions: [
-          if (!_isCameraMode && _scannedPages.isNotEmpty) ...[
+          if (!_isCameraMode && _pages.isNotEmpty) ...[
             IconButton(
               icon: const Icon(Icons.crop),
               tooltip: 'Crop Current Page',
-              onPressed: _cropCurrentPage,
+              onPressed: _isProcessing ? null : _cropCurrentPage,
             ),
             IconButton(
               icon: const Icon(Icons.folder_zip),
@@ -373,7 +488,8 @@ class _ScannerScreenState extends State<ScannerScreen> {
                       onPressed: () {
                         Navigator.pop(ctx);
                         setState(() {
-                          _scannedPages.clear();
+                          _pages.clear();
+                          _currentPageIndex = 0;
                           _switchToCameraMode();
                         });
                       },
@@ -404,102 +520,16 @@ class _ScannerScreenState extends State<ScannerScreen> {
               ),
             )
           : null,
-      bottomNavigationBar: (!_isCameraMode && _scannedPages.isNotEmpty)
+      bottomNavigationBar: (!_isCameraMode && _pages.isNotEmpty)
           ? _buildBottomBar()
           : null,
     );
   }
 
   Widget _buildBody() {
-    // CAMERA MODE
-    if (_isCameraMode) {
-      if (_isInitializing || _isResumingCamera) {
-        return Container(
-          color: Colors.black,
-          child: const Center(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                CircularProgressIndicator(color: Colors.white),
-                SizedBox(height: 16),
-                Text(
-                  'Starting Camera...',
-                  style: TextStyle(color: Colors.white70),
-                ),
-              ],
-            ),
-          ),
-        );
-      }
+    if (_isCameraMode) return _buildCameraBody();
 
-      if (cameras.isEmpty ||
-          _controller == null ||
-          !_controller!.value.isInitialized) {
-        return Center(
-          child: Text(
-            kIsWeb
-                ? 'No camera detected (Web needs camera permission).'
-                : 'No camera detected',
-          ),
-        );
-      }
-
-      return Stack(
-        alignment: Alignment.center,
-        children: [
-          Positioned.fill(
-            child: CameraPreview(_controller!, key: _cameraPreviewKey),
-          ),
-          if (_scannedPages.isNotEmpty)
-            Positioned(
-              top: 40,
-              right: 20,
-              child: Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 6,
-                ),
-                decoration: BoxDecoration(
-                  color: Colors.black87,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const Icon(
-                      Icons.collections,
-                      size: 16,
-                      color: Colors.amber,
-                    ),
-                    const SizedBox(width: 6),
-                    Text(
-                      '${_scannedPages.length}',
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          const Positioned(
-            bottom: 100,
-            child: Text(
-              'TAP BUTTON TO CAPTURE',
-              style: TextStyle(
-                color: Colors.white70,
-                fontSize: 14,
-                letterSpacing: 1,
-              ),
-            ),
-          ),
-        ],
-      );
-    }
-
-    // PREVIEW MODE
-    if (_scannedPages.isEmpty) {
+    if (_pages.isEmpty) {
       return const Center(child: Text('No pages scanned'));
     }
 
@@ -507,24 +537,39 @@ class _ScannerScreenState extends State<ScannerScreen> {
       children: [
         Expanded(
           flex: 3,
-          child: InteractiveViewer(
-            minScale: 0.5,
-            maxScale: 4.0,
-            child: Container(
-              color: Colors.grey[200],
-              padding: const EdgeInsets.all(16),
-              child: Center(
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(8),
-                  child: Image.memory(
-                    _scannedPages[_currentPageIndex],
-                    fit: BoxFit.contain, // not forcing A4
+          child: Stack(
+            children: [
+              InteractiveViewer(
+                minScale: 0.5,
+                maxScale: 4.0,
+                child: Container(
+                  color: Colors.grey[200],
+                  padding: const EdgeInsets.all(16),
+                  child: Center(
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(8),
+                      child: Image.memory(
+                        _currentPage.current,
+                        fit: BoxFit.contain,
+                        gaplessPlayback: true,
+                      ),
+                    ),
                   ),
                 ),
               ),
-            ),
+              if (_isProcessing)
+                Positioned.fill(
+                  child: Container(
+                    color: Colors.black38,
+                    child: const Center(
+                      child: CircularProgressIndicator(color: Colors.white),
+                    ),
+                  ),
+                ),
+            ],
           ),
         ),
+        _buildFilterBar(),
         Container(
           height: 140,
           padding: const EdgeInsets.symmetric(vertical: 8),
@@ -540,7 +585,7 @@ class _ScannerScreenState extends State<ScannerScreen> {
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
                     Text(
-                      'Page ${_currentPageIndex + 1} / ${_scannedPages.length}',
+                      'Page ${_currentPageIndex + 1} / ${_pages.length}',
                       style: const TextStyle(fontWeight: FontWeight.bold),
                     ),
                     Row(
@@ -553,8 +598,7 @@ class _ScannerScreenState extends State<ScannerScreen> {
                         ),
                         IconButton(
                           icon: const Icon(Icons.chevron_right),
-                          onPressed:
-                              _currentPageIndex < _scannedPages.length - 1
+                          onPressed: _currentPageIndex < _pages.length - 1
                               ? () => setState(() => _currentPageIndex++)
                               : null,
                         ),
@@ -566,7 +610,7 @@ class _ScannerScreenState extends State<ScannerScreen> {
               Expanded(
                 child: ListView.builder(
                   scrollDirection: Axis.horizontal,
-                  itemCount: _scannedPages.length,
+                  itemCount: _pages.length,
                   itemBuilder: (context, index) {
                     final isSelected = index == _currentPageIndex;
                     return GestureDetector(
@@ -587,8 +631,9 @@ class _ScannerScreenState extends State<ScannerScreen> {
                           fit: StackFit.expand,
                           children: [
                             Image.memory(
-                              _scannedPages[index],
+                              _pages[index].current,
                               fit: BoxFit.cover,
+                              gaplessPlayback: true,
                             ),
                             Positioned(
                               top: 2,
@@ -614,6 +659,125 @@ class _ScannerScreenState extends State<ScannerScreen> {
                 ),
               ),
             ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildFilterBar() {
+    final current = _currentPage.filter;
+    return Container(
+      color: Theme.of(context).colorScheme.surfaceContainerHighest,
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      child: Row(
+        children: [
+          Expanded(
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: ScanFilter.values.map((f) {
+                  final selected = f == current;
+                  return Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                    child: ChoiceChip(
+                      avatar: Icon(f.icon, size: 18),
+                      label: Text(f.label),
+                      selected: selected,
+                      onSelected: _isProcessing
+                          ? null
+                          : (_) => _setFilterForCurrent(f),
+                    ),
+                  );
+                }).toList(),
+              ),
+            ),
+          ),
+          IconButton(
+            tooltip: 'Apply "${current.label}" to all pages',
+            icon: const Icon(Icons.done_all),
+            onPressed: _isProcessing || _pages.length < 2
+                ? null
+                : _applyCurrentFilterToAll,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCameraBody() {
+    if (_isInitializing || _isResumingCamera) {
+      return Container(
+        color: Colors.black,
+        child: const Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              CircularProgressIndicator(color: Colors.white),
+              SizedBox(height: 16),
+              Text(
+                'Starting Camera...',
+                style: TextStyle(color: Colors.white70),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    if (cameras.isEmpty ||
+        _controller == null ||
+        !_controller!.value.isInitialized) {
+      return Center(
+        child: Text(
+          kIsWeb
+              ? 'No camera detected (Web needs camera permission).'
+              : 'No camera detected',
+        ),
+      );
+    }
+
+    return Stack(
+      alignment: Alignment.center,
+      children: [
+        Positioned.fill(
+          child: CameraPreview(_controller!, key: _cameraPreviewKey),
+        ),
+        if (_pages.isNotEmpty)
+          Positioned(
+            top: 40,
+            right: 20,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              decoration: BoxDecoration(
+                color: Colors.black87,
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.collections, size: 16, color: Colors.amber),
+                  const SizedBox(width: 6),
+                  Text(
+                    '${_pages.length}',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        const Positioned(
+          bottom: 100,
+          child: Text(
+            'TAP BUTTON TO CAPTURE',
+            style: TextStyle(
+              color: Colors.white70,
+              fontSize: 14,
+              letterSpacing: 1,
+            ),
           ),
         ),
       ],
@@ -659,7 +823,7 @@ class _ScannerScreenState extends State<ScannerScreen> {
               child: ElevatedButton.icon(
                 onPressed: _downloadPDF,
                 icon: const Icon(Icons.picture_as_pdf),
-                label: Text('SAVE PDF (${_scannedPages.length})'),
+                label: Text('SAVE PDF (${_pages.length})'),
                 style: ElevatedButton.styleFrom(
                   backgroundColor: Colors.indigo,
                   foregroundColor: Colors.white,
@@ -674,8 +838,10 @@ class _ScannerScreenState extends State<ScannerScreen> {
   }
 }
 
-/// Web-compatible crop screen using crop_your_image.
-/// No A4 ratio => free size crop.
+// ---------------------------------------------------------------------------
+// CROP PAGE (free size, web compatible)
+// ---------------------------------------------------------------------------
+
 class CropPage extends StatefulWidget {
   final Uint8List imageBytes;
   final double? aspectRatio;
